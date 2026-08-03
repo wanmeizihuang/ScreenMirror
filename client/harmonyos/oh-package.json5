@@ -1,0 +1,9 @@
+{
+  "modelVersion": "5.0.0",
+  "description": "WiFi Screen Mirroring - HarmonyOS Client",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hvigor": "5.0.0",
+    "@ohos/hvigor-ohos-plugin": "5.0.0"
+  }
+}

@@ -1,0 +1,228 @@
+syntax = "proto3";
+
+package screenmirror.protocol;
+
+option csharp_namespace = "ScreenMirror.Protocol";
+option java_package = "com.screenmirror.protocol";
+option java_outer_classname = "Messages";
+
+// ============================================================
+// 顶层消息包装
+// ============================================================
+message Envelope {
+  MessageType type = 1;
+  bytes payload = 2;          // 序列化的具体消息
+  int64 timestamp = 3;        // Unix 毫秒时间戳
+  string request_id = 4;      // 请求追踪 ID
+}
+
+enum MessageType {
+  UNKNOWN = 0;
+
+  // 连接管理
+  DEVICE_HELLO = 1;
+  DEVICE_HELLO_ACK = 2;
+  HEARTBEAT = 3;
+  DISCONNECT = 4;
+
+  // 屏幕镜像
+  SCREEN_INFO = 10;
+  START_STREAM = 11;
+  STOP_STREAM = 12;
+  STREAM_CONTROL = 13;        // 暂停/恢复/码率调整
+
+  // 反向控制
+  TOUCH_EVENT = 20;
+  KEY_EVENT = 21;
+  MOUSE_EVENT = 22;
+  SCROLL_EVENT = 23;
+
+  // 设备能力交换
+  CAPABILITY_REQUEST = 30;
+  CAPABILITY_RESPONSE = 31;
+
+  // 剪贴板 (Phase 2)
+  CLIPBOARD_SYNC = 40;
+
+  // 文件传输 (Phase 2)
+  FILE_TRANSFER_REQUEST = 50;
+  FILE_TRANSFER_RESPONSE = 51;
+  FILE_CHUNK = 52;
+}
+
+// ============================================================
+// 连接管理
+// ============================================================
+message DeviceHello {
+  string device_name = 1;
+  string device_model = 2;
+  string os_version = 3;
+  string app_version = 4;
+  DeviceType device_type = 5;
+  int32 protocol_version = 6; // 协议版本号
+}
+
+enum DeviceType {
+  DEVICE_UNKNOWN = 0;
+  DEVICE_ANDROID = 1;
+  DEVICE_IOS = 2;
+  DEVICE_HARMONYOS = 3;
+  DEVICE_WINDOWS = 4;
+  DEVICE_MACOS = 5;
+  DEVICE_TV = 6;
+}
+
+message DeviceHelloAck {
+  bool accepted = 1;
+  string message = 2;         // 拒绝原因
+  int32 protocol_version = 3;
+  string session_id = 4;
+}
+
+message Heartbeat {
+  int64 client_time = 1;
+}
+
+// ============================================================
+// 屏幕镜像
+// ============================================================
+message ScreenInfo {
+  int32 width = 1;
+  int32 height = 2;
+  int32 dpi = 3;
+  float frame_rate = 4;
+  VideoCodec codec = 5;
+  int32 max_bitrate_kbps = 6; // 最大码率
+  bool has_audio = 7;
+  AudioCodec audio_codec = 8;
+  int32 rotation = 9;         // 屏幕旋转角度: 0/90/180/270
+}
+
+enum VideoCodec {
+  VIDEO_H264 = 0;
+  VIDEO_H265 = 1;
+  VIDEO_AV1 = 2;
+}
+
+enum AudioCodec {
+  AUDIO_AAC = 0;
+  AUDIO_OPUS = 1;
+}
+
+message StreamControl {
+  StreamCommand command = 1;
+  int32 target_bitrate_kbps = 2;
+  int32 target_fps = 3;
+}
+
+enum StreamCommand {
+  STREAM_RESUME = 0;
+  STREAM_PAUSE = 1;
+  STREAM_ADJUST = 2;          // 调整参数
+}
+
+// ============================================================
+// 反向控制
+// ============================================================
+message TouchEvent {
+  TouchAction action = 1;
+  int32 pointer_id = 2;
+  float x = 3;                // 归一化坐标 0.0~1.0
+  float y = 4;
+  float pressure = 5;         // 0.0~1.0
+  int64 event_time = 6;
+}
+
+enum TouchAction {
+  TOUCH_DOWN = 0;
+  TOUCH_MOVE = 1;
+  TOUCH_UP = 2;
+  TOUCH_CANCEL = 3;
+}
+
+message KeyEvent {
+  int32 key_code = 1;         // Android KeyEvent keycode
+  KeyAction action = 2;
+  int32 meta_state = 3;       // 修饰键状态
+  int64 event_time = 4;
+}
+
+enum KeyAction {
+  KEY_DOWN = 0;
+  KEY_UP = 1;
+}
+
+message MouseEvent {
+  MouseAction action = 1;
+  float x = 2;
+  float y = 3;
+  int32 button = 4;
+}
+
+enum MouseAction {
+  MOUSE_MOVE = 0;
+  MOUSE_DOWN = 1;
+  MOUSE_UP = 2;
+}
+
+message ScrollEvent {
+  float x = 1;
+  float y = 2;
+  float h_scroll = 3;         // 水平滚动量
+  float v_scroll = 4;         // 垂直滚动量
+}
+
+// ============================================================
+// 能力交换
+// ============================================================
+message CapabilityRequest {
+  // 空——请求对方上报能力
+}
+
+message CapabilityResponse {
+  repeated Capability capabilities = 1;
+}
+
+message Capability {
+  string name = 1;            // 例如: "clipboard", "file_transfer"
+  string version = 2;
+  bool enabled = 3;
+}
+
+// ============================================================
+// 剪贴板同步 (Phase 2)
+// ============================================================
+message ClipboardSync {
+  string text = 1;
+  string mime_type = 2;       // text/plain, text/html, image/png
+  bytes image_data = 3;
+}
+
+// ============================================================
+// 文件传输 (Phase 2)
+// ============================================================
+message FileTransferRequest {
+  string file_name = 1;
+  int64 file_size = 2;
+  string mime_type = 3;
+  TransferDirection direction = 4;
+}
+
+enum TransferDirection {
+  SEND = 0;
+  RECEIVE = 1;
+}
+
+message FileTransferResponse {
+  bool accepted = 1;
+  string transfer_id = 2;
+  int32 chunk_size = 3;       // 建议分块大小
+}
+
+message FileChunk {
+  string transfer_id = 1;
+  int32 chunk_index = 2;
+  int32 total_chunks = 3;
+  bytes data = 4;
+  bytes checksum = 5;         // SHA-256
+}

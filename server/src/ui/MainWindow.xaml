@@ -1,0 +1,136 @@
+<Window x:Class="ScreenMirror.Server.UI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        Title="ScreenMirror" Icon="/ScreenMirror.ico"
+        Width="420" Height="600"
+        MinWidth="380" MinHeight="480"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ResizeMode="CanResize"
+        MouseDown="OnWindowMouseDown">
+
+    <Window.Resources>
+        <Style x:Key="DeviceCard" TargetType="Border">
+            <Setter Property="Background" Value="White"/>
+            <Setter Property="CornerRadius" Value="12"/>
+            <Setter Property="Margin" Value="0,0,0,8"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+        <Style x:Key="RefreshButton" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Foreground" Value="#888"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontSize" Value="13"/>
+        </Style>
+    </Window.Resources>
+
+    <Border Background="#F5F5F5" CornerRadius="16" BorderBrush="#E0E0E0" BorderThickness="1">
+        <Grid Margin="24">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- 标题栏 -->
+            <Grid Grid.Row="0" Margin="0,0,0,16">
+                <TextBlock Text="ScreenMirror" FontSize="18" FontWeight="500"
+                           Foreground="#1a1a1a" VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button Content="-" Width="32" Height="32" FontSize="16"
+                            Foreground="#888" Background="Transparent" BorderThickness="0"
+                            Click="OnMinimizeClick" Cursor="Hand"/>
+                    <Button Content="x" Width="32" Height="32" FontSize="16"
+                            Foreground="#888" Background="Transparent" BorderThickness="0"
+                            Click="OnCloseClick" Cursor="Hand"/>
+                </StackPanel>
+            </Grid>
+
+            <!-- 状态栏 -->
+            <Border Grid.Row="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,16"
+                    Background="{Binding StatusBackground}">
+                <TextBlock Text="{Binding StatusText}" FontSize="13"
+                           Foreground="{Binding StatusForeground}"
+                           HorizontalAlignment="Center"/>
+            </Border>
+
+            <!-- 操作按钮 -->
+            <Grid Grid.Row="2" Margin="0,0,0,12">
+                <Button Content="刷新设备列表" Click="OnRefreshClick"
+                        Style="{StaticResource RefreshButton}"
+                        FontSize="12" Padding="8,4"
+                        HorizontalAlignment="Left"/>
+                <TextBlock Text="{Binding DeviceCountText}" FontSize="12"
+                           Foreground="#aaa" HorizontalAlignment="Right"
+                           VerticalAlignment="Center"/>
+            </Grid>
+
+            <!-- 设备列表 -->
+            <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto">
+                <ItemsControl x:Name="DeviceList" Margin="0,0,0,8"
+                              ItemsSource="{Binding Devices}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Style="{StaticResource DeviceCard}" Padding="16,14"
+                                    MouseLeftButtonDown="OnDeviceClick">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+
+                                    <!-- 设备图标 -->
+                                    <Border Grid.Column="0" Width="40" Height="40"
+                                            Background="#E8F5E9" CornerRadius="20"
+                                            Margin="0,0,12,0">
+                                        <TextBlock Text="&#x1F4F1;" FontSize="20"
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"/>
+                                    </Border>
+
+                                    <!-- 设备信息 -->
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding DeviceName}" FontSize="14"
+                                                   FontWeight="500" Foreground="#1a1a1a"/>
+                                        <TextBlock Text="{Binding DisplayName}" FontSize="11"
+                                                   Foreground="#999" Margin="0,2,0,0"/>
+                                    </StackPanel>
+
+                                    <!-- 连接按钮 -->
+                                    <Button Grid.Column="2" Content="连接"
+                                            VerticalAlignment="Center"
+                                            Background="#4CAF50" Foreground="White"
+                                            BorderThickness="0" FontSize="12"
+                                            Padding="12,4" Cursor="Hand"
+                                            Click="OnDeviceConnectClick"
+                                            Tag="{Binding}"/>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+
+            <!-- 底部信息 -->
+            <TextBlock Grid.Row="4" Text="Design by zzh · ScreenMirror"
+                       FontSize="11" Foreground="#ccc" Margin="0,8,0,0"
+                       HorizontalAlignment="Center"/>
+
+            <!-- 加载指示器 -->
+            <Border Grid.Row="3" Background="#80FFFFFF" Visibility="{Binding IsLoading}">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Text="正在扫描设备..." FontSize="14" Foreground="#666"/>
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Border>
+</Window>

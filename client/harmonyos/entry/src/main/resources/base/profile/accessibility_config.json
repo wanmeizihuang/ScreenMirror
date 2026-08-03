@@ -1,0 +1,11 @@
+{
+  "accessibilityCapabilities": [
+    "retrieve",
+    "gesture",
+    "keyEventObserver",
+    "touchGuide"
+  ],
+  "accessibilityEventTypes": [
+    "allEvent"
+  ]
+}

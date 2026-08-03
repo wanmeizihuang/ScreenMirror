@@ -1,0 +1,81 @@
+# .gitignore — Wifi投屏 (ScreenMirror)
+
+# ===== .NET =====
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+[Dd]ebug/
+[Rr]elease/
+*.nupkg
+*.snupkg
+
+# NuGet
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+*.nuget.props
+*.nuget.targets
+
+# Visual Studio
+.vs/
+*.vsp
+*.vspx
+*.sap
+*.psess
+*.pidb
+*.vshost.exe
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+
+# ===== Android / Gradle =====
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+build/
+.gradle/
+local.properties
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+*.jks
+*.keystore
+
+# Android Studio
+*.iws
+.idea/
+.gradle/
+out/
+
+# Gradle wrapper (optional - if you want to use system Gradle)
+# gradle/wrapper/gradle-wrapper.jar
+# gradlew
+# gradlew.bat
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ===== WorkBuddy =====
+.workbuddy/
+
+# ===== Project Specific =====
+# Release is generated from builds, not source
+release/
+# Shared directory is empty/reserved
+shared/
+
+# Temp files
+tmp/
+*.log
+*.backup_*

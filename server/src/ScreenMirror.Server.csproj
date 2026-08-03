@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>ScreenMirror.Server</RootNamespace>
+    <AssemblyName>ScreenMirror</AssemblyName>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationIcon>ScreenMirror.ico</ApplicationIcon>
+
+    <!-- 发布配置: 由命令行参数控制 -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- VLC 解码渲染 (LibVLCSharp + LibVLC 硬件解码) -->
+    <PackageReference Include="LibVLCSharp.WPF" Version="3.9.3" />
+    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.21" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="ScreenMirror.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\protocol\csharp\ScreenMirror.Protocol.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="ScreenMirror.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

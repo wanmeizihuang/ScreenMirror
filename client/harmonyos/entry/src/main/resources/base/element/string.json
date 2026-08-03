@@ -1,0 +1,26 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "WiFi 投屏发送端" },
+    { "name": "EntryAbility_desc", "value": "投屏主页" },
+    { "name": "EntryAbility_label", "value": "投屏" },
+    { "name": "ReverseControlExtension_label", "value": "反向控制无障碍服务" },
+    { "name": "ReverseControlExtension_desc", "value": "接收电脑控制指令并注入到设备" },
+    { "name": "microphone_reason", "value": "用于同步录制音频（可选）" },
+    { "name": "float_window_reason", "value": "投屏后台保活需要悬浮窗权限" },
+    { "name": "device_list_title", "value": "可用设备" },
+    { "name": "btn_scan", "value": "扫描设备" },
+    { "name": "btn_stop", "value": "停止投屏" },
+    { "name": "btn_cast", "value": "投屏" },
+    { "name": "btn_manual_ip", "value": "手动输入IP" },
+    { "name": "status_idle", "value": "等待连接" },
+    { "name": "status_connecting", "value": "连接中..." },
+    { "name": "status_screen_capture", "value": "等待录屏授权" },
+    { "name": "status_streaming", "value": "投屏中" },
+    { "name": "hint_manual_ip", "value": "输入接收端 IP 地址" },
+    { "name": "accessibility_prompt", "value": "开启无障碍服务以支持反向控制" },
+    { "name": "accessibility_settings", "value": "前往辅助功能设置" },
+    { "name": "error_capture_permission", "value": "录屏权限被拒绝" },
+    { "name": "error_connect_failed", "value": "连接失败" },
+    { "name": "error_no_device", "value": "未发现可用设备" }
+  ]
+}

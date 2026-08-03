@@ -1,0 +1,11 @@
+<Application x:Class="ScreenMirror.Server.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="UI/MainWindow.xaml">
+    <Application.Resources>
+        <!-- 极简全局样式 -->
+        <Style TargetType="Window">
+            <Setter Property="FontFamily" Value="Segoe UI, Microsoft YaHei, sans-serif"/>
+        </Style>
+    </Application.Resources>
+</Application>

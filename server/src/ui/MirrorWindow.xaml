@@ -1,0 +1,72 @@
+<Window x:Class="ScreenMirror.Server.UI.MirrorWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vlc="clr-namespace:LibVLCSharp.WPF;assembly=LibVLCSharp.WPF"
+        Title="ScreenMirror - 投屏中" Icon="/ScreenMirror.ico"
+        Width="420" Height="800"
+        MinWidth="320" MinHeight="560"
+        WindowStartupLocation="CenterScreen"
+        Background="#1a1a1a"
+        ResizeMode="CanResize"
+        MouseDown="OnWindowMouseDown"
+        SizeChanged="OnWindowSizeChanged">
+
+    <Grid x:Name="RootGrid">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 顶部控制栏 -->
+        <Border Grid.Row="0" Padding="12,8" Background="#2a2a2a">
+            <Grid>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock x:Name="TitleText" Text="ScreenMirror"
+                               FontSize="12" Foreground="#aaa"
+                               VerticalAlignment="Center" FontWeight="500"/>
+                    <TextBlock x:Name="FpsText" Text=""
+                               FontSize="11" Foreground="#4CAF50"
+                               VerticalAlignment="Center" Margin="12,0,0,0"/>
+                </StackPanel>
+
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="PinButton" Content="📌"
+                            Click="OnPinClick"
+                            FontSize="13" Foreground="#aaa" Background="Transparent"
+                            BorderThickness="0" Padding="6,2" Cursor="Hand"
+                            ToolTip="置顶窗口"/>
+                    <Button Content="断开" Click="OnDisconnectClick"
+                            FontSize="11" Foreground="#ff6b6b" Background="Transparent"
+                            BorderThickness="0" Padding="8,2" Cursor="Hand"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- VLC 视频渲染区域 -->
+        <Grid Grid.Row="1" x:Name="VideoHost" Background="#0a0a0a">
+            <vlc:VideoView x:Name="VlcVideoView" HorizontalAlignment="Stretch"
+                           VerticalAlignment="Stretch"/>
+            <TextBlock x:Name="LoadingText" Text="正在接收画面..."
+                       FontSize="14" Foreground="#666"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"/>
+        </Grid>
+
+        <!-- 底部状态栏 -->
+        <Border Grid.Row="2" Padding="12,6" Background="#2a2a2a">
+            <Grid>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock x:Name="StatusInfo" Text="等待连接"
+                               FontSize="11" Foreground="#FFC107"/>
+                    <Rectangle Width="1" Fill="#444" Margin="12,2"/>
+                    <TextBlock x:Name="DeviceInfo" Text="--"
+                               FontSize="11" Foreground="#888"/>
+                </StackPanel>
+                <TextBlock Text="Design by zzh · ScreenMirror"
+                           FontSize="10" Foreground="#555"
+                           HorizontalAlignment="Right" VerticalAlignment="Center"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

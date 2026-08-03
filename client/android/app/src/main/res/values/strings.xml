@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ScreenMirror</string>
+    <string name="accessibility_desc">ScreenMirror 反向控制服务，允许通过电脑控制手机</string>
+    <string name="footer_text">Design by zzh · ScreenMirror</string>
+</resources>
