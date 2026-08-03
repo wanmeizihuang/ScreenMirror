@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>手机屏幕实时镜像到电脑 + 反向控制（用电脑键鼠操作手机）</strong>
+  <strong>手机屏幕实时镜像到电脑 + 反向控制（后续迭代）</strong>
 </p>
 
 <p align="center">
@@ -19,7 +19,7 @@
 
 ## 简介
 
-ScreenMirror 是一款轻量级局域网投屏工具。Android 手机通过 WiFi 将屏幕实时镜像到 Windows 电脑，还支持**反向控制**——直接用电脑的鼠标键盘操作手机。
+ScreenMirror 是一款轻量级局域网投屏工具。Android 手机通过 WiFi 将屏幕实时镜像到 Windows 电脑，后续支持**反向控制**——直接用电脑的鼠标键盘操作手机。
 
 - **无需 USB 线**：纯 WiFi 局域网传输，手机主动扫码/发现电脑后连接
 - **硬件加速**：Android 端 MediaCodec 硬编 H.264，PC 端 LibVLC 硬解（DXVA2/D3D11VA）
@@ -34,7 +34,6 @@ ScreenMirror 是一款轻量级局域网投屏工具。Android 手机通过 WiFi
 | 功能 | 说明 |
 |------|------|
 | 屏幕镜像 | Android → Windows 实时投屏，H.264 硬件编码 |
-| 反向控制 | PC 鼠标/键盘 → Android 触摸/按键注入（需手机开启无障碍服务） |
 | 局域网发现 | UDP 广播 + mDNS，一键扫描连接 |
 | 信号检测 | NAL 帧计数监控，3 秒无信号显示提示，6 秒自动重连 |
 
@@ -43,6 +42,7 @@ ScreenMirror 是一款轻量级局域网投屏工具。Android 手机通过 WiFi
 - [ ] 传输加密（ECDH + AES-128-GCM，算法已实现，待接线）
 - [ ] 分辨率动态降采样（720p/1080p 可选）
 - [ ] 心跳保活
+- [ ] 反向控制
 - [ ] 多设备同屏
 
 ### 🔮 远期（Phase 3）
