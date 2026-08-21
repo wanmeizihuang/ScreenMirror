@@ -10,6 +10,7 @@ import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 data class DiscoveredDevice(
@@ -32,13 +33,22 @@ class DeviceDiscoveryService(
         const val DISCOVERY_PORT = 35357
         const val SERVICE_TYPE = "_screenmirror._tcp"
         const val TAG = "DiscoveryService"
+        private val RECEIVER_DEVICE_TYPES = setOf("windows", "mac", "tv")
     }
 
     private var nsdManager: NsdManager? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
     private var udpSocket: DatagramSocket? = null
     private var isRegistered = false
+    private var registeredServiceName: String? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val deviceId: String by lazy {
+        val preferences = context.getSharedPreferences("screenmirror_identity", Context.MODE_PRIVATE)
+        preferences.getString("device_id", null)
+            ?: UUID.randomUUID().toString().also {
+                preferences.edit().putString("device_id", it).apply()
+            }
+    }
 
     val discoveredDevices = ConcurrentHashMap<String, DiscoveredDevice>()
     var onDeviceFound: ((DiscoveredDevice) -> Unit)? = null
@@ -54,6 +64,7 @@ class DeviceDiscoveryService(
             this.port = listenPort
             setAttribute("device_name", deviceName)
             setAttribute("device_type", "android")
+            setAttribute("device_id", deviceId)
             setAttribute("version", "1")
             setAttribute("has_audio", if (hasAudio) "1" else "0")
         }
@@ -64,9 +75,12 @@ class DeviceDiscoveryService(
             }
             override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
+                registeredServiceName = serviceInfo.serviceName
                 Log.i(TAG, "mDNS registered: ${serviceInfo.serviceName}")
             }
-            override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) {}
+            override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) {
+                registeredServiceName = null
+            }
         }
 
         try {
@@ -93,6 +107,7 @@ class DeviceDiscoveryService(
                     put("type", "screenmirror.discover")
                     put("device_name", deviceName)
                     put("device_type", "android")
+                    put("device_id", deviceId)
                     put("version", 1)
                     put("port", 35354)
                 }
@@ -171,12 +186,19 @@ class DeviceDiscoveryService(
                 val host = serviceInfo.host.hostAddress ?: return
                 // 过滤掉本机
                 if (host == localIp || host.startsWith("127.") || host.startsWith("0.")) return
+                val deviceType = serviceInfo.attributes["device_type"]
+                    ?.toString(Charsets.UTF_8)
+                    ?.lowercase()
+                    ?: "unknown"
+                if (deviceType !in RECEIVER_DEVICE_TYPES) return
+
                 val device = DiscoveredDevice(
                     deviceName = serviceInfo.serviceName.removePrefix("ScreenMirror-"),
-                    deviceType = serviceInfo.attributes["device_type"]?.toString() ?: "unknown",
+                    deviceType = deviceType,
                     host = host,
                     port = serviceInfo.port,
-                    hasAudio = serviceInfo.attributes["has_audio"]?.toString() == "1",
+                    hasAudio = serviceInfo.attributes["has_audio"]
+                        ?.toString(Charsets.UTF_8) == "1",
                 )
                 val key = "${device.host}:${device.port}"
                 val isNew = !discoveredDevices.containsKey(key)
@@ -188,8 +210,11 @@ class DeviceDiscoveryService(
         val discoveryListener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {}
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                if (serviceInfo.serviceType == SERVICE_TYPE)
+                if (serviceInfo.serviceType == SERVICE_TYPE &&
+                    serviceInfo.serviceName != registeredServiceName
+                ) {
                     nsdManager?.resolveService(serviceInfo, resolveListener)
+                }
             }
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
                 val key = "${serviceInfo.host}:${serviceInfo.port}"
@@ -232,6 +257,7 @@ class DeviceDiscoveryService(
                         put("type", "screenmirror.present")
                         put("device_name", deviceName)
                         put("device_type", "android")
+                        put("device_id", deviceId)
                         put("version", 1)
                         put("port", myPort)
                         put("host", getLocalIpAddress())
@@ -242,6 +268,9 @@ class DeviceDiscoveryService(
                         packet.address, DISCOVERY_PORT))
                 }
                 "screenmirror.present" -> {
+                    val deviceType = obj.optString("device_type", "unknown").lowercase()
+                    if (deviceType !in RECEIVER_DEVICE_TYPES) return
+
                     // 过滤自己的广播回声
                     val sourceHost = packet.address.hostAddress ?: ""
                     val localHost = getLocalIpAddress()
@@ -249,7 +278,7 @@ class DeviceDiscoveryService(
 
                     val device = DiscoveredDevice(
                         deviceName = obj.optString("device_name", "Unknown"),
-                        deviceType = obj.optString("device_type", "unknown"),
+                        deviceType = deviceType,
                         host = obj.optString("host", sourceHost),  // PC 自报 IP
                         port = obj.optInt("port", 35354),
                     )

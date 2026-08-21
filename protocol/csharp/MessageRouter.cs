@@ -70,15 +70,27 @@ public class MessageRouter
     /// </summary>
     public void BindToConnection(ControlConnection connection)
     {
-        connection.OnMessageReceived += async (type, payload) =>
+        connection.OnMessageReceived += (type, payload) =>
         {
-            await RouteAsync(type, payload);
+            _ = RouteSafelyAsync(type, payload);
         };
 
         connection.OnDisconnected += (id) =>
         {
             // 连接断开时路由一次空通知（插件可自行清理）
         };
+    }
+
+    private async Task RouteSafelyAsync(ControlMessageType type, ReadOnlyMemory<byte> payload)
+    {
+        try
+        {
+            await RouteAsync(type, payload);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[MessageRouter] {type} route failed: {ex}");
+        }
     }
 
     /// <summary>

@@ -63,14 +63,14 @@ Type   名称              方向              说明
 0x02   KEY_EVENT         PC → Phone        按键事件
 0x03   SCREEN_INFO       Phone → PC        屏幕参数（分辨率/旋转/编码）
 0x04   DEVICE_HELLO      Both             设备握手
-0x05   HEARTBEAT         Both             心跳（协议已定义，当前未发送）
-0x06   HEARTBEAT_ACK     Both             心跳响应（当前未发送）
+0x05   HEARTBEAT         Phone → PC       心跳探测（每 3 秒）
+0x06   HEARTBEAT_ACK     PC → Phone       心跳响应（回显探测时间戳）
 0x07   STREAM_START      Phone → PC       开始推流
 0x08   STREAM_STOP       Both             停止推流
 0x09   STREAM_PAUSE      PC → Phone       暂停推流
 0x0A   STREAM_RESUME     PC → Phone       恢复推流
 0x0B   MOUSE_EVENT       PC → Phone        鼠标事件
-0x0C   SCROLL_EVENT      PC → Phone        滚轮事件（预留）
+0x0C   SCROLL_EVENT      PC → Phone        滚轮事件
 0x0D   ROTATION_CHANGE   Phone → PC       旋转变化
 0x0E   ERROR             Both             错误信息
 
@@ -118,6 +118,8 @@ Type   名称              方向              说明
 19 字节
 ```
 
+`Width`、`Height` 和视频帧均采用设备当前显示方向。反向控制坐标也以当前视频帧方向归一化，`Rotation` 仅描述设备相对自然方向的状态，接收端不得据此再次旋转输入坐标。
+
 #### DEVICE_HELLO (0x04)
 ```
 [1]   Version:    协议版本号
@@ -132,7 +134,7 @@ Type   名称              方向              说明
 [8]   Timestamp:  Unix 毫秒 (int64 大端)
 ────────────────────────────────
 8 字节
-（注：当前两端均未发送心跳，断线靠 NAL 计数间接感知）
+Android 每 3 秒发送一次 HEARTBEAT；Windows 收到后原样回显 Timestamp。
 ```
 
 #### MOUSE_EVENT (0x0B)
@@ -172,8 +174,8 @@ Type   名称              方向              说明
 TXT 记录:
   device_name=<设备名称>
   device_type=<android|ios|harmonyos|windows|mac|tv>
+  device_id=<匿名安装标识>  (同一设备多网卡地址去重)
   version=<协议版本号>
-  mac=<MAC地址后6位>   (用于去重)
   has_audio=<0>        (当前恒为 0)
 ```
 
@@ -187,9 +189,9 @@ TXT 记录:
   "type": "screenmirror.discover",
   "device_name": "My Phone",
   "device_type": "android",
+  "device_id": "3f6146a1-7ee4-4cb7-9e70-c2c362a47e66",
   "version": 1,
   "port": 35354,
-  "mac_suffix": "a1b2c3",
   "has_audio": false
 }
 
@@ -198,12 +200,16 @@ TXT 记录:
   "type": "screenmirror.present",
   "device_name": "My PC",
   "device_type": "windows",
+  "device_id": "可选的匿名安装标识",
   "version": 1,
   "port": 35354,
-  "host": "192.168.1.100",
-  "mac_suffix": "d4e5f6"
+  "host": "192.168.1.100"
 }
 ```
+
+接收端优先以 `device_type + device_id` 识别物理设备；旧版本未携带
+`device_id` 时回退到 `IP:端口`。同一设备通过多个网卡响应时，优先选择
+与本机有效物理网卡同网段且该网卡具有默认网关的地址。
 
 ## 连接建立流程（手机主动）
 
@@ -219,15 +225,17 @@ TXT 记录:
 7. 手机 → PC: SCREEN_INFO + STREAM_START
 8. 手机 → PC: 持续推送 VIDEO_FRAME(0x22) 视频流
 9. 反向控制: PC → 手机 MOUSE_EVENT / KEY_EVENT（鼠标位于投屏窗口上时）
+10. 保活: 手机每 3 秒发送 HEARTBEAT，PC 回 HEARTBEAT_ACK；任一端超时后关闭连接
 
 注: PC 端「主动连接设备」路径当前不可用 —— 手机端不监听 TCP，仅 PC 监听。
-注: 心跳(0x05/0x06) 两端均未发送。
 ```
 
-## 心跳与断线检测（协议预留，当前未启用）
+## 心跳与断线检测
 
 ```
-心跳间隔:     协议预留 5 秒（实际未发送）
-超时检测:     依赖 PC 端 NAL 计数: 连续 3 秒无新增 → 标记「信号丢失」, 6 秒 → 自动重置 VLC
-重连策略:     当前为手动重连（手机回到前台 / 重新点投屏）
+心跳间隔:     Android 每 3 秒发送 HEARTBEAT
+心跳响应:     Windows 回显 HEARTBEAT 的 8 字节 Timestamp
+连接超时:     Android 10 秒无入站数据；Windows 10 秒无入站数据
+卡流检测:     PC 端 NAL 连续 3 秒无新增 → 标记「信号丢失」, 6 秒 → 自动重置 VLC
+断线处理:     关闭 TCP 并触发现有停止投屏/等待重新连接流程
 ```

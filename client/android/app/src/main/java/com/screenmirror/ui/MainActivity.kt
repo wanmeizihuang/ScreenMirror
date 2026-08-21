@@ -45,6 +45,7 @@ class MainActivity : ComponentActivity() {
     private var captureService: ScreenCaptureService? = null
     private var isBound = false
     private var isStreaming by mutableStateOf(false)
+    private var accessibilityEnabled by mutableStateOf(false)
     private var connectionStatus by mutableStateOf("等待开始投屏")
     private var pendingDevice: DiscoveredDevice? = null
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -70,6 +71,9 @@ class MainActivity : ComponentActivity() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             startScreenCapture(result.resultCode, result.data!!)
+        } else {
+            connectionStatus = "录屏授权被取消"
+            appendLog("录屏授权被取消")
         }
     }
 
@@ -97,7 +101,6 @@ class MainActivity : ComponentActivity() {
     private fun doStartCapture(resultCode: Int, data: Intent) {
         val device = pendingDevice ?: return
         val host = device.host
-        val controlPort = 35354
         connectionStatus = "启动屏幕采集..."
 
         val connection = activeConnection
@@ -106,36 +109,83 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val sendNal: (ByteArray) -> Unit = { nalData ->
+        val sendNal: (ByteArray) -> Unit = sendNal@{ nalData ->
+            if (activeConnection !== connection || !connection.isConnected) {
+                return@sendNal
+            }
             connection.sendMessage(ControlMessageType.VIDEO_FRAME, nalData)
+            if (!connection.isConnected) return@sendNal
+
             videoFramesSent++
             if (videoFramesSent == 1L || videoFramesSent % 30 == 0L) {
-                appendLog("发送NAL #$videoFramesSent ${nalData.size}B")
-                connectionStatus = "已发送 $videoFramesSent 帧"
+                val framesSent = videoFramesSent
+                runOnUiThread {
+                    if (activeConnection === connection && connection.isConnected) {
+                        appendLog("发送NAL #$framesSent ${nalData.size}B")
+                        connectionStatus = "已发送 $framesSent 帧"
+                    }
+                }
             }
         }
 
-        captureService?.startCapture(
-            resultCode, data,
-            host = host,
-            sendNalCallback = sendNal,
-            callback = { screenInfo ->
-                connection.sendScreenInfo(screenInfo)
-                connection.sendMessage(ControlMessageType.STREAM_START)
-            }
-        )
-        isStreaming = true
-        connectionStatus = "推流中"
+        val service = captureService
+        if (service == null) {
+            connectionStatus = "投屏服务未就绪"
+            stopStreaming()
+            return
+        }
 
-        // 投屏期间阻止屏幕休眠
-        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        try {
+            service.startCapture(
+                resultCode, data,
+                host = host,
+                sendNalCallback = sendNal,
+                callback = { screenInfo ->
+                    connection.sendScreenInfo(screenInfo)
+                    if (activeConnection !== connection || !connection.isConnected) {
+                        runOnUiThread { stopStreaming() }
+                        return@startCapture
+                    }
+
+                    connection.sendMessage(ControlMessageType.STREAM_START)
+                    runOnUiThread {
+                        if (activeConnection !== connection || !connection.isConnected) {
+                            stopStreaming()
+                            return@runOnUiThread
+                        }
+
+                        isStreaming = true
+                        connectionStatus = if (accessibilityEnabled) {
+                            "推流中 ${screenInfo.width}x${screenInfo.height}，反向控制已启用"
+                        } else {
+                            "推流中 ${screenInfo.width}x${screenInfo.height}，反向控制未启用"
+                        }
+                        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                },
+                errorCallback = { message ->
+                    runOnUiThread {
+                        appendLog(message)
+                        connectionStatus = message
+                        stopStreaming()
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            val message = "投屏启动失败: ${e.message ?: e.javaClass.simpleName}"
+            appendLog(message)
+            connectionStatus = message
+            stopStreaming()
+        }
     }
 
     private var activeConnection: ControlConnection? = null
     private var videoFramesSent: Long = 0L
+    private var lastControlUnavailableNoticeAt = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        accessibilityEnabled = isAccessibilityServiceEnabled()
 
         // 启动时清理超过 24 小时的诊断日志
         try {
@@ -168,10 +218,6 @@ class MainActivity : ComponentActivity() {
         var selectedDevice by remember { mutableStateOf<DiscoveredDevice?>(null) }
         var isScanning by remember { mutableStateOf(false) }
         var manualIp by remember { mutableStateOf("") }
-        var accessibilityEnabled by remember {
-            mutableStateOf(isAccessibilityServiceEnabled())
-        }
-
         val headerGradient = Brush.horizontalGradient(
             colors = listOf(Color(0xFF60A5FA), Color(0xFF2563EB))
         )
@@ -258,8 +304,7 @@ class MainActivity : ComponentActivity() {
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = if (isStreaming) "正在将屏幕推送到 ${selectedDevice?.deviceName ?: "PC"}"
-                                        else "扫描设备或手动输入 IP 连接",
+                                text = connectionStatus,
                                 fontSize = 12.sp,
                                 color = Color(0xFF9CA3AF)
                             )
@@ -536,10 +581,7 @@ class MainActivity : ComponentActivity() {
                 // 投屏按钮
                 if (!isStreaming) {
                     Button(
-                        onClick = {
-                            pendingDevice = device
-                            requestMediaProjection(device)
-                        },
+                        onClick = onClick,
                         shape = RoundedCornerShape(10.dp),
                         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 6.dp),
                         colors = ButtonDefaults.buttonColors(
@@ -593,12 +635,15 @@ class MainActivity : ComponentActivity() {
         val controlPort = 35354
         val host = device.host
         connectionStatus = "连接 $host:$controlPort..."
+        appendLog("开始连接 $host:$controlPort")
 
         // 先建立控制连接
         scope.launch {
             try {
                 val connectionManager = ConnectionManager()
-                val connection = connectionManager.connect(host, controlPort)
+                val connection = withContext(Dispatchers.IO) {
+                    connectionManager.connect(host, controlPort)
+                }
 
             if (connection != null) {
                 activeConnection = connection
@@ -608,31 +653,70 @@ class MainActivity : ComponentActivity() {
 
                 // 路由 PC 端反向控制指令到无障碍服务
                 connection.onMessage = msgHandler@{ type, payload ->
-                    val svc = ReverseControlService.getInstance() ?: return@msgHandler
-                    when (type) {
-                        ControlMessageType.MOUSE_EVENT ->
-                            svc.handleMouseEvent(ControlProtocolCodec.decodeMouseEvent(payload))
-                        ControlMessageType.KEY_EVENT ->
-                            svc.handleKeyEvent(ControlProtocolCodec.decodeKeyEvent(payload))
-                        ControlMessageType.TOUCH_EVENT ->
-                            svc.handleTouchEvent(ControlProtocolCodec.decodeTouchEvent(payload))
-                        else -> {}
+                    if (type !in setOf(
+                            ControlMessageType.MOUSE_EVENT,
+                            ControlMessageType.KEY_EVENT,
+                            ControlMessageType.TOUCH_EVENT,
+                            ControlMessageType.SCROLL_EVENT
+                        )
+                    ) return@msgHandler
+
+                    val svc = ReverseControlService.getInstance()
+                    if (svc == null) {
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        if (now - lastControlUnavailableNoticeAt >= 2_000L) {
+                            lastControlUnavailableNoticeAt = now
+                            connection.send(ControlProtocolCodec.encodeError(
+                                1001,
+                                "手机端无障碍服务未启用，无法进行反向控制"
+                            ))
+                            runOnUiThread {
+                                accessibilityEnabled = false
+                                connectionStatus = "投屏中，反向控制未启用"
+                                appendLog("收到控制指令，但无障碍服务未启用")
+                            }
+                        }
+                        return@msgHandler
+                    }
+
+                    try {
+                        when (type) {
+                            ControlMessageType.MOUSE_EVENT ->
+                                svc.handleMouseEvent(ControlProtocolCodec.decodeMouseEvent(payload))
+                            ControlMessageType.KEY_EVENT ->
+                                svc.handleKeyEvent(ControlProtocolCodec.decodeKeyEvent(payload))
+                            ControlMessageType.TOUCH_EVENT ->
+                                svc.handleTouchEvent(ControlProtocolCodec.decodeTouchEvent(payload))
+                            ControlMessageType.SCROLL_EVENT ->
+                                svc.handleScrollEvent(ControlProtocolCodec.decodeScrollEvent(payload))
+                            else -> {}
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.e("ReverseControl", "Invalid control message", e)
                     }
                 }
 
                 // 监听 TCP 断开：PC 端主动断开或网络异常时自动停止投屏
                 connection.onDisconnected = { _ ->
-                    appendLog("TCP 连接断开，停止投屏")
-                    runOnUiThread { stopStreaming() }
+                    android.util.Log.w(
+                        "ScreenMirror",
+                        "TCP 连接断开: ${connection.lastDisconnectReason}"
+                    )
+                    runOnUiThread {
+                        appendLog("TCP 连接断开: ${connection.lastDisconnectReason}")
+                        stopStreaming()
+                    }
                 }
 
                 // 发送握手
-                connection.sendDeviceHello(
-                    DeviceHelloData(
-                        deviceType = DeviceType.ANDROID,
-                        deviceName = android.os.Build.MODEL ?: "Android"
+                withContext(Dispatchers.IO) {
+                    connection.sendDeviceHello(
+                        DeviceHelloData(
+                            deviceType = DeviceType.ANDROID,
+                            deviceName = android.os.Build.MODEL ?: "Android"
+                        )
                     )
-                )
+                }
 
                 // 启动屏幕采集服务
                 val intent = Intent(this@MainActivity, ScreenCaptureService::class.java)
@@ -647,10 +731,13 @@ class MainActivity : ComponentActivity() {
                     doStartCapture(resultCode, data)
                 }
             } else {
-                connectionStatus = "连接失败"
+                val reason = connectionManager.lastConnectionError ?: "未知错误"
+                connectionStatus = "连接失败: $reason"
+                appendLog("TCP连接失败: $reason")
             }
             } catch (e: Exception) {
                 connectionStatus = "连接异常: ${e.message}"
+                appendLog("TCP连接异常: ${e.javaClass.simpleName}: ${e.message}")
             }
         }
     }
@@ -659,7 +746,7 @@ class MainActivity : ComponentActivity() {
 
     private fun stopStreaming() {
         if (isStopping) return
-        if (!isStreaming) return
+        if (!isStreaming && activeConnection == null) return
         isStopping = true
         isStreaming = false
         connectionStatus = "已停止"
@@ -704,17 +791,20 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        accessibilityEnabled = isAccessibilityServiceEnabled()
         captureService?.isAppInForeground = true
         if (isStreaming) captureService?.hideOverlay()
     }
 
     override fun onDestroy() {
-        stopStreaming()  // 确保资源释放
+        if (isFinishing) {
+            try { activeConnection?.disconnect() } catch (_: Exception) {}
+            try { captureService?.stopCapture() } catch (_: Exception) {}
+        }
         if (isBound) unbindService(serviceConnection)
-        try {
-            val intent = Intent(this, ScreenCaptureService::class.java)
-            stopService(intent)
-        } catch (_: Exception) {}
+        if (isFinishing) {
+            try { stopService(Intent(this, ScreenCaptureService::class.java)) } catch (_: Exception) {}
+        }
         discoveryService.stop()
         scope.cancel()
         super.onDestroy()

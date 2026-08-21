@@ -61,6 +61,7 @@ class ScreenCaptureService : Service() {
     private var targetBitrate = 8_000_000
     private var targetFps = 30
     private var resultCallback: ((ScreenInfoData) -> Unit)? = null
+    private var captureErrorCallback: ((String) -> Unit)? = null
 
     inner class LocalBinder : Binder() {
         fun getService(): ScreenCaptureService = this@ScreenCaptureService
@@ -112,57 +113,80 @@ class ScreenCaptureService : Service() {
         vPort: Int = 35355, aPort: Int = 35356,
         bitrate: Int = 8_000_000, fps: Int = 30,
         sendNalCallback: ((ByteArray) -> Unit)? = null,
-        callback: (ScreenInfoData) -> Unit
+        callback: (ScreenInfoData) -> Unit,
+        errorCallback: (String) -> Unit = {}
     ) {
+        check(isRunning.compareAndSet(false, true)) { "投屏已经在运行" }
         targetHost = host; targetBitrate = bitrate; targetFps = fps
         resultCallback = callback; sendNal = sendNalCallback
+        captureErrorCallback = errorCallback
         logd("startCapture host=$host")
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, createNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIFICATION_ID, createNotification())
-        }
-        acquireWakeLock()
-        // overlay 由 MainActivity.onPause 控制显示，不在 startCapture 时显示
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    createNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, createNotification())
+            }
+            acquireWakeLock()
 
-        // 降采样
-        val metrics = resources.displayMetrics
-        val maxDim = 1280
-        val rawW = metrics.widthPixels; val rawH = metrics.heightPixels
-        if (rawW >= rawH) { screenWidth = maxDim; screenHeight = maxDim * rawH / rawW }
-        else { screenHeight = maxDim; screenWidth = maxDim * rawW / rawH }
-        screenWidth = (screenWidth / 16) * 16
-        screenHeight = (screenHeight / 16) * 16
-        if (screenWidth < 176) screenWidth = 176
-        if (screenHeight < 144) screenHeight = 144
-        screenDpi = metrics.densityDpi
-        logd("resolution raw=${rawW}x${rawH}  scaled=${screenWidth}x${screenHeight}")
+            val metrics = getRealDisplayMetrics()
+            val maxDim = 1280
+            val rawW = metrics.widthPixels; val rawH = metrics.heightPixels
+            if (rawW >= rawH) { screenWidth = maxDim; screenHeight = maxDim * rawH / rawW }
+            else { screenHeight = maxDim; screenWidth = maxDim * rawW / rawH }
+            screenWidth = (screenWidth / 2) * 2
+            screenHeight = (screenHeight / 2) * 2
+            if (screenWidth < 176) screenWidth = 176
+            if (screenHeight < 144) screenHeight = 144
+            screenDpi = metrics.densityDpi
+            logd("resolution raw=${rawW}x${rawH} scaled=${screenWidth}x${screenHeight}")
 
-        val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = pm.getMediaProjection(resultCode, data)
-        mediaProjection?.registerCallback(ProjectionCallback(), null)
+            val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = pm.getMediaProjection(resultCode, data)
+                ?: error("无法创建 MediaProjection")
+            mediaProjection?.registerCallback(ProjectionCallback(), null)
 
-        if (sendNal != null) {
-            videoConnected = true
-            startEncoding(); isRunning.set(true)
-        } else {
-            scope.launch {
-                for (attempt in 1..5) {
-                    try {
-                        videoSocket = Socket(targetHost, vPort).apply {
-                            tcpNoDelay = true; sendBufferSize = 256 * 1024
+            if (sendNal != null) {
+                videoConnected = true
+                startEncoding()
+            } else {
+                scope.launch {
+                    for (attempt in 1..5) {
+                        try {
+                            videoSocket = Socket(targetHost, vPort).apply {
+                                tcpNoDelay = true; sendBufferSize = 256 * 1024
+                            }
+                            videoConnected = true
+                            startEncoding()
+                            break
+                        } catch (e: Exception) {
+                            delay(500L * attempt)
                         }
-                        videoConnected = true; startEncoding(); isRunning.set(true)
-                        break
-                    } catch (e: Exception) {
-                        delay(500L * attempt)
+                    }
+                    if (!videoConnected) {
+                        captureErrorCallback?.invoke("无法连接视频通道")
+                        stopCapture()
                     }
                 }
-                if (!videoConnected) stopSelf()
             }
+        } catch (e: Exception) {
+            logd("startCapture FAILED: ${e.javaClass.simpleName}: ${e.message}")
+            stopCapture()
+            throw e
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun getRealDisplayMetrics(): DisplayMetrics {
+        return DisplayMetrics().also { metrics ->
+            (getSystemService(WINDOW_SERVICE) as WindowManager)
+                .defaultDisplay
+                .getRealMetrics(metrics)
         }
     }
 
@@ -189,8 +213,12 @@ class ScreenCaptureService : Service() {
             width = screenWidth, height = screenHeight, dpi = screenDpi,
             frameRate = targetFps, codec = VideoCodec.H264, maxBitrateKbps = targetBitrate / 1000,
             rotation = (getSystemService(WINDOW_SERVICE) as android.view.WindowManager).defaultDisplay.rotation * 90)
-        resultCallback?.invoke(info)
-        scope.launch(Dispatchers.IO) { encodeAndSend() }
+        scope.launch(Dispatchers.IO) {
+            // Send stream metadata before the first encoded frame. The callback writes to
+            // the control socket, so it must never run on Android's main thread.
+            resultCallback?.invoke(info)
+            encodeAndSend()
+        }
     }
 
     private suspend fun encodeAndSend() {
@@ -223,20 +251,26 @@ class ScreenCaptureService : Service() {
             }
         } catch (e: Exception) {
             logd("encodeAndSend EXCEPTION: ${e.message}")
+            captureErrorCallback?.invoke("编码发送失败: ${e.message ?: e.javaClass.simpleName}")
         } finally {
             logd("encodeAndSend loop exited, calling stopCapture")
             stopCapture()
         }
     }
 
+    @Synchronized
     fun stopCapture() {
-        if (!isRunning.compareAndSet(true, false)) return
+        val wasRunning = isRunning.getAndSet(false)
+        if (!wasRunning && mediaCodec == null && mediaProjection == null && virtualDisplay == null) return
         logd("stopCapture called")
         try { virtualDisplay?.release(); virtualDisplay = null } catch (_: Exception) {}
         try { mediaCodec?.stop(); mediaCodec?.release(); mediaCodec = null } catch (_: Exception) {}
         try { videoSocket?.close() } catch (_: Exception) {}
         try { audioSocket?.close() } catch (_: Exception) {}
-        try { mediaProjection?.stop(); mediaProjection = null } catch (_: Exception) {}
+        val projection = mediaProjection
+        mediaProjection = null
+        try { projection?.stop() } catch (_: Exception) {}
+        videoConnected = false
         releaseWakeLock()
         hideKeepAliveOverlay()
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -420,8 +454,8 @@ class ScreenCaptureService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            val ch = NotificationChannel(CHANNEL_ID, "投屏服务", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "ScreenMirror running"; setShowBadge(true)
+            val ch = NotificationChannel(CHANNEL_ID, "投屏服务", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "ScreenMirror running"; setShowBadge(false)
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
             getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
@@ -435,12 +469,11 @@ class ScreenCaptureService : Service() {
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("屏幕投屏中").setContentText("正在投屏到 $targetHost")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setOngoing(true).setPriority(Notification.PRIORITY_MAX)
+            .setOngoing(true).setPriority(Notification.PRIORITY_LOW)
             .setCategory(Notification.CATEGORY_SERVICE)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .setContentIntent(pi).setShowWhen(true)
-            .setFullScreenIntent(pi, true).build()
+            .setContentIntent(pi).setShowWhen(true).build()
     }
 
-    companion object { private const val CHANNEL_ID = "screen_mirror_channel"; private const val NOTIFICATION_ID = 1001 }
+    companion object { private const val CHANNEL_ID = "screen_mirror_capture"; private const val NOTIFICATION_ID = 1001 }
 }
