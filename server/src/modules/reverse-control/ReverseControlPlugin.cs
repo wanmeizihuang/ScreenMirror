@@ -1,5 +1,8 @@
 using System.Diagnostics;
+using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading.Channels;
 using ScreenMirror.Protocol;
 using ScreenMirror.Server.Plugins;
 
@@ -10,6 +13,10 @@ namespace ScreenMirror.Server.Modules.ReverseControl;
 /// </summary>
 public class ReverseControlPlugin : IPlugin
 {
+    private static readonly object DiagnosticLogLock = new();
+    private static readonly string DiagnosticLogPath = Path.Combine(
+        Path.GetTempPath(), "screenmirror-reverse-control.log");
+
     private ControlConnection? _connection;
     private IntPtr _mirrorWindowHandle;
     private ScreenInfoData _screenInfo;
@@ -18,9 +25,30 @@ public class ReverseControlPlugin : IPlugin
     private LowLevelMouseHook? _mouseHook;
     private LowLevelKeyboardHook? _keyboardHook;
     private bool _isActive;
+    private bool _forwardingLeftDrag;
+    private readonly object _coalescingLock = new();
+    private Channel<OutboundInput>? _outboundInputs;
+    private CancellationTokenSource? _senderCts;
+    private Task? _senderTask;
+    private byte[]? _pendingMouseMove;
+    private byte[]? _pendingScroll;
+    private bool _mouseMoveQueued;
+    private bool _scrollQueued;
+    private long _mouseHookEventCount;
+    private long _mouseButtonEventCount;
+    private long _sentEventCount;
+
+    private enum OutboundInputKind
+    {
+        Data,
+        MouseMove,
+        Scroll,
+    }
+
+    private readonly record struct OutboundInput(OutboundInputKind Kind, byte[]? Data = null);
 
     public string Name => "ReverseControl";
-    public string Version => "1.0.0";
+    public string Version => "1.1.0";
     public PluginState State { get; private set; } = PluginState.Unloaded;
     public ControlMessageType[] SubscribedMessageTypes => new[]
     {
@@ -44,15 +72,21 @@ public class ReverseControlPlugin : IPlugin
         }
     }
 
+    public Func<(float Left, float Top, float Width, float Height)?>? InputBoundsProvider { get; set; }
+
     public Task<bool> Initialize(ControlConnection connection)
     {
         _connection = connection;
         State = PluginState.Initialized;
+        WriteDiagnostic($"Initialize: connection={connection.ConnectionId}, remote={connection.RemoteHost}, connected={connection.IsConnected}");
         return Task.FromResult(true);
     }
 
     public Task Start()
     {
+        WriteDiagnostic($"Start: state={State}, hwnd=0x{_mirrorWindowHandle.ToInt64():X}");
+        StartSender();
+
         // 低级别钩子必须在具有消息循环的线程（UI 线程）上安装，
         // 否则系统不会回调钩子过程
         if (System.Windows.Application.Current?.Dispatcher != null)
@@ -62,15 +96,17 @@ public class ReverseControlPlugin : IPlugin
 
         _isActive = true;
         State = PluginState.Running;
+        WriteDiagnostic("Start completed: state=Running");
         return Task.CompletedTask;
     }
 
-    public Task Stop()
+    public async Task Stop()
     {
+        WriteDiagnostic($"Stop: state={State}");
         StopHooks();
         _isActive = false;
+        await StopSenderAsync();
         State = PluginState.Initialized;
-        return Task.CompletedTask;
     }
 
     public PluginCapability[] GetCapabilities() => new[]
@@ -79,7 +115,7 @@ public class ReverseControlPlugin : IPlugin
         {
             Name = "reverse_control",
             Description = "鼠标键盘反向控制 Android 设备",
-            Version = "1.0.0",
+            Version = "1.1.0",
         }
     };
 
@@ -94,8 +130,26 @@ public class ReverseControlPlugin : IPlugin
 
     private void StartHooks()
     {
-        _mouseHook = new LowLevelMouseHook(OnMouseEvent);
-        _keyboardHook = new LowLevelKeyboardHook(OnKeyEvent);
+        StopHooks();
+        if (_mirrorWindowHandle == IntPtr.Zero)
+        {
+            WriteDiagnostic("StartHooks skipped: mirror window handle is zero");
+            return;
+        }
+
+        try
+        {
+            _mouseHook = new LowLevelMouseHook(OnMouseEvent, OnScrollEvent);
+            _keyboardHook = new LowLevelKeyboardHook(OnKeyEvent);
+            WriteDiagnostic($"Hooks installed: mouse=0x{_mouseHook.HookHandle.ToInt64():X}, keyboard=0x{_keyboardHook.HookHandle.ToInt64():X}");
+        }
+        catch (Exception ex)
+        {
+            StopHooks();
+            State = PluginState.Error;
+            WriteDiagnostic($"Hook installation failed: {ex}");
+            throw;
+        }
     }
 
     private void StopHooks()
@@ -104,35 +158,207 @@ public class ReverseControlPlugin : IPlugin
         _keyboardHook?.Dispose();
         _mouseHook = null;
         _keyboardHook = null;
+        _forwardingLeftDrag = false;
     }
 
-    private async void OnMouseEvent(MouseEventData mouseEvent)
+    private void OnMouseEvent(MouseEventData mouseEvent)
+    {
+        var hookEventNumber = Interlocked.Increment(ref _mouseHookEventCount);
+        var buttonEventNumber = mouseEvent.Action == MouseAction.Move
+            ? 0
+            : Interlocked.Increment(ref _mouseButtonEventCount);
+        var shouldLog = ShouldLogInputEvent(buttonEventNumber);
+        if (_connection == null || !_connection.IsConnected)
+        {
+            if (shouldLog)
+                WriteDiagnostic($"Mouse #{hookEventNumber} ignored: no active connection, action={mouseEvent.Action}, button={mouseEvent.Button}");
+            return;
+        }
+        if (_mirrorWindowHandle == IntPtr.Zero)
+        {
+            if (shouldLog)
+                WriteDiagnostic($"Mouse #{hookEventNumber} ignored: window handle is zero");
+            return;
+        }
+
+        bool isOverVideo = IsCursorOverInputBounds(out var cursor, out var bounds);
+        if (shouldLog)
+        {
+            WriteDiagnostic(
+                $"Mouse #{hookEventNumber}: action={mouseEvent.Action}, button={mouseEvent.Button}, " +
+                $"cursor={FormatPoint(cursor)}, bounds={FormatBounds(bounds)}, inside={isOverVideo}");
+        }
+        if (mouseEvent.Button == 0 && mouseEvent.Action == MouseAction.Down)
+        {
+            if (!isOverVideo) return;
+            _forwardingLeftDrag = true;
+        }
+        else if (mouseEvent.Action == MouseAction.Move)
+        {
+            if (!_forwardingLeftDrag) return;
+        }
+        else if (mouseEvent.Button == 0 && mouseEvent.Action == MouseAction.Up)
+        {
+            if (!_forwardingLeftDrag) return;
+            _forwardingLeftDrag = false;
+        }
+        else if (!isOverVideo)
+        {
+            return;
+        }
+
+        // 钩子回调运行在 UI 消息循环中，只做坐标计算和入队，绝不等待网络。
+        var (nx, ny) = GetNormalizedCoords();
+        var evt = mouseEvent with { X = nx, Y = ny };
+        var data = ControlProtocolCodec.EncodeMouseEvent(evt);
+        if (evt.Action == MouseAction.Move)
+            QueueCoalesced(OutboundInputKind.MouseMove, data);
+        else
+            QueueData(data);
+    }
+
+    private void OnScrollEvent(ScrollEventData scrollEvent)
+    {
+        if (_connection == null || !_connection.IsConnected) return;
+        if (!IsCursorOverInputBounds(out var cursor, out var bounds))
+        {
+            WriteDiagnostic($"Scroll ignored: cursor={FormatPoint(cursor)}, bounds={FormatBounds(bounds)}");
+            return;
+        }
+
+        var (nx, ny) = GetNormalizedCoords();
+        var evt = scrollEvent with { X = nx, Y = ny };
+        QueueCoalesced(OutboundInputKind.Scroll, ControlProtocolCodec.EncodeScrollEvent(evt));
+    }
+
+    private void OnKeyEvent(KeyEventData keyEvent)
     {
         if (_connection == null || !_connection.IsConnected) return;
         if (_mirrorWindowHandle == IntPtr.Zero) return;
-        if (!IsCursorOverMirrorWindow()) return;   // 仅当鼠标位于投屏窗口上时才转发
+        if (GetForegroundWindow() != _mirrorWindowHandle) return;
 
-        try
-        {
-            // 计算相对投屏窗口的归一化坐标（修正原 Down/Up 坐标恒为 0 的 bug）
-            var (nx, ny) = GetNormalizedCoords();
-            var evt = mouseEvent with { X = nx, Y = ny };
-            await _connection.SendAsync(ControlProtocolCodec.EncodeMouseEvent(evt));
-        }
-        catch { }
+        QueueData(ControlProtocolCodec.EncodeKeyEvent(keyEvent));
     }
 
-    private async void OnKeyEvent(KeyEventData keyEvent)
+    private void StartSender()
     {
-        if (_connection == null || !_connection.IsConnected) return;
-        if (_mirrorWindowHandle == IntPtr.Zero) return;
-        if (!IsCursorOverMirrorWindow()) return;
+        if (_senderTask is { IsCompleted: false }) return;
 
-        try
+        _senderCts?.Dispose();
+        _senderCts = new CancellationTokenSource();
+        _outboundInputs = Channel.CreateUnbounded<OutboundInput>(new UnboundedChannelOptions
         {
-            await _connection.SendAsync(ControlProtocolCodec.EncodeKeyEvent(keyEvent));
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false,
+        });
+        var reader = _outboundInputs.Reader;
+        var cancellationToken = _senderCts.Token;
+        _senderTask = Task.Run(() => SendLoopAsync(reader, cancellationToken));
+        WriteDiagnostic("Outbound sender started");
+    }
+
+    private async Task StopSenderAsync()
+    {
+        var channel = _outboundInputs;
+        var cts = _senderCts;
+        var senderTask = _senderTask;
+
+        _outboundInputs = null;
+        _senderCts = null;
+        _senderTask = null;
+
+        lock (_coalescingLock)
+        {
+            _pendingMouseMove = null;
+            _pendingScroll = null;
+            _mouseMoveQueued = false;
+            _scrollQueued = false;
         }
-        catch { }
+
+        channel?.Writer.TryComplete();
+        cts?.Cancel();
+        if (senderTask != null)
+        {
+            try { await senderTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
+        cts?.Dispose();
+    }
+
+    private void QueueData(byte[] data)
+    {
+        var queued = _outboundInputs?.Writer.TryWrite(new OutboundInput(OutboundInputKind.Data, data)) == true;
+        if (!queued)
+            WriteDiagnostic($"Input packet queue failed: bytes={data.Length}");
+    }
+
+    private void QueueCoalesced(OutboundInputKind kind, byte[] data)
+    {
+        var channel = _outboundInputs;
+        if (channel == null) return;
+
+        lock (_coalescingLock)
+        {
+            ref byte[]? pending = ref (kind == OutboundInputKind.MouseMove
+                ? ref _pendingMouseMove
+                : ref _pendingScroll);
+            ref bool queued = ref (kind == OutboundInputKind.MouseMove
+                ? ref _mouseMoveQueued
+                : ref _scrollQueued);
+
+            pending = data;
+            if (queued) return;
+            queued = channel.Writer.TryWrite(new OutboundInput(kind));
+        }
+    }
+
+    private async Task SendLoopAsync(
+        ChannelReader<OutboundInput> reader,
+        CancellationToken cancellationToken)
+    {
+        await foreach (var item in reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        {
+            byte[]? data = item.Data;
+            if (item.Kind != OutboundInputKind.Data)
+            {
+                lock (_coalescingLock)
+                {
+                    if (item.Kind == OutboundInputKind.MouseMove)
+                    {
+                        data = _pendingMouseMove;
+                        _pendingMouseMove = null;
+                        _mouseMoveQueued = false;
+                    }
+                    else
+                    {
+                        data = _pendingScroll;
+                        _pendingScroll = null;
+                        _scrollQueued = false;
+                    }
+                }
+            }
+
+            var connection = _connection;
+            if (data == null || connection == null || !connection.IsConnected) continue;
+
+            try
+            {
+                await connection.SendAsync(data, cancellationToken).ConfigureAwait(false);
+                var sentEventNumber = Interlocked.Increment(ref _sentEventCount);
+                if (sentEventNumber <= 20 || sentEventNumber % 200 == 0)
+                    WriteDiagnostic($"Input packet sent #{sentEventNumber}: kind={item.Kind}, bytes={data.Length}");
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ReverseControl] input send failed: {ex}");
+                WriteDiagnostic($"Input send failed: {ex}");
+            }
+        }
     }
 
     /// <summary>
@@ -140,18 +366,10 @@ public class ReverseControlPlugin : IPlugin
     /// </summary>
     public (float x, float y) WindowsToAndroid(float winX, float winY, float winWidth, float winHeight)
     {
-        // 窗口坐标系 — 需要确保缩放比例正确
+        // 视频尺寸和 Android 显示尺寸均已采用当前方向，不能再依据 Rotation 二次旋转。
         float normX = Math.Clamp(winX / winWidth, 0f, 1f);
         float normY = Math.Clamp(winY / winHeight, 0f, 1f);
-
-        // 考虑屏幕旋转
-        return _screenInfo.Rotation switch
-        {
-            90 => (normY, 1f - normX),
-            180 => (1f - normX, 1f - normY),
-            270 => (1f - normY, normX),
-            _ => (normX, normY),
-        };
+        return (normX, normY);
     }
 
     // ===== 窗口命中检测与坐标换算 (Win32) =====
@@ -166,9 +384,6 @@ public class ReverseControlPlugin : IPlugin
     private static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")]
-    private static extern IntPtr WindowFromPoint(POINT pt);
-
-    [DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
     [DllImport("user32.dll")]
@@ -178,30 +393,90 @@ public class ReverseControlPlugin : IPlugin
     /// 判断当前鼠标是否位于投屏窗口之上（或该窗口为前台窗口）。
     /// 反向控制仅在用户与投屏窗口交互时才生效，避免误控 PC 自身。
     /// </summary>
-    private bool IsCursorOverMirrorWindow()
+    private bool IsCursorOverInputBounds(
+        out (int X, int Y)? cursor,
+        out (float Left, float Top, float Width, float Height)? bounds)
     {
-        if (_mirrorWindowHandle == IntPtr.Zero) return false;
-        if (GetForegroundWindow() == _mirrorWindowHandle) return true;
-        if (GetCursorPos(out var pt))
-            return WindowFromPoint(pt) == _mirrorWindowHandle;
-        return false;
+        cursor = null;
+        bounds = null;
+        if (!GetCursorPos(out var pt)) return false;
+        cursor = (pt.X, pt.Y);
+        bounds = GetInputBounds();
+        return bounds.HasValue &&
+               pt.X >= bounds.Value.Left && pt.X <= bounds.Value.Left + bounds.Value.Width &&
+               pt.Y >= bounds.Value.Top && pt.Y <= bounds.Value.Top + bounds.Value.Height;
     }
 
     /// <summary>
-    /// 将当前鼠标屏幕坐标换算为相对投屏窗口的归一化坐标 (0~1，含旋转修正)
+    /// 将当前鼠标屏幕坐标换算为相对实际视频画面的归一化坐标 (0~1)
     /// </summary>
     private (float x, float y) GetNormalizedCoords()
     {
         if (!GetCursorPos(out var pt)) return (0f, 0f);
-        if (!GetWindowRect(_mirrorWindowHandle, out var rect)) return (0f, 0f);
+        var bounds = GetInputBounds();
+        if (!bounds.HasValue) return (0f, 0f);
 
-        float winX = pt.X - rect.Left;
-        float winY = pt.Y - rect.Top;
-        float winW = rect.Right - rect.Left;
-        float winH = rect.Bottom - rect.Top;
-        if (winW <= 0 || winH <= 0) return (0f, 0f);
+        return WindowsToAndroid(
+            pt.X - bounds.Value.Left,
+            pt.Y - bounds.Value.Top,
+            bounds.Value.Width,
+            bounds.Value.Height);
+    }
 
-        return WindowsToAndroid(winX, winY, winW, winH);
+    private (float Left, float Top, float Width, float Height)? GetInputBounds()
+    {
+        (float Left, float Top, float Width, float Height)? provided = null;
+        try { provided = InputBoundsProvider?.Invoke(); } catch { }
+        if (provided.HasValue && provided.Value.Width > 0 && provided.Value.Height > 0)
+            return FitVideoBounds(provided.Value);
+
+        if (!GetWindowRect(_mirrorWindowHandle, out var rect)) return null;
+        float width = rect.Right - rect.Left;
+        float height = rect.Bottom - rect.Top;
+        if (width <= 0 || height <= 0) return null;
+        return FitVideoBounds((rect.Left, rect.Top, width, height));
+    }
+
+    private static string FormatPoint((int X, int Y)? point) =>
+        point.HasValue ? $"({point.Value.X},{point.Value.Y})" : "unavailable";
+
+    private static string FormatBounds((float Left, float Top, float Width, float Height)? bounds) =>
+        bounds.HasValue
+            ? $"({bounds.Value.Left:F0},{bounds.Value.Top:F0},{bounds.Value.Width:F0},{bounds.Value.Height:F0})"
+            : "unavailable";
+
+    private static bool ShouldLogInputEvent(long eventNumber) =>
+        eventNumber > 0 && (eventNumber <= 20 || eventNumber % 200 == 0);
+
+    private static void WriteDiagnostic(string message)
+    {
+        try
+        {
+            lock (DiagnosticLogLock)
+            {
+                File.AppendAllText(
+                    DiagnosticLogPath,
+                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}");
+            }
+        }
+        catch { }
+    }
+
+    private (float Left, float Top, float Width, float Height) FitVideoBounds(
+        (float Left, float Top, float Width, float Height) bounds)
+    {
+        if (_screenInfo.Width <= 0 || _screenInfo.Height <= 0) return bounds;
+
+        float videoAspect = (float)_screenInfo.Width / _screenInfo.Height;
+        float hostAspect = bounds.Width / bounds.Height;
+        if (hostAspect > videoAspect)
+        {
+            float width = bounds.Height * videoAspect;
+            return (bounds.Left + (bounds.Width - width) / 2f, bounds.Top, width, bounds.Height);
+        }
+
+        float height = bounds.Width / videoAspect;
+        return (bounds.Left, bounds.Top + (bounds.Height - height) / 2f, bounds.Width, height);
     }
 }
 
@@ -221,27 +496,38 @@ public class LowLevelMouseHook : IDisposable
     private IntPtr _hookId = IntPtr.Zero;
     private readonly Win32HookProc _proc;
     private readonly Action<MouseEventData> _callback;
+    private readonly Action<ScrollEventData> _scrollCallback;
+    private bool _leftButtonDown;
 
-    public LowLevelMouseHook(Action<MouseEventData> callback)
+    public IntPtr HookHandle => _hookId;
+
+    public LowLevelMouseHook(
+        Action<MouseEventData> callback,
+        Action<ScrollEventData> scrollCallback)
     {
         _callback = callback;
+        _scrollCallback = scrollCallback;
         _proc = HookCallback;
         _hookId = SetWindowsHookEx(WH_MOUSE_LL, _proc, GetModuleHandle(null!), 0);
+        if (_hookId == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to install low-level mouse hook");
     }
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         if (nCode >= 0)
         {
-            var evt = new MouseEventData();
+            MouseEventData? evt = null;
 
             switch ((int)wParam)
             {
                 case WM_LBUTTONDOWN:
                     evt = new MouseEventData { Action = MouseAction.Down, Button = 0 };
+                    _leftButtonDown = true;
                     break;
                 case WM_LBUTTONUP:
                     evt = new MouseEventData { Action = MouseAction.Up, Button = 0 };
+                    _leftButtonDown = false;
                     break;
                 case WM_RBUTTONDOWN:
                     evt = new MouseEventData { Action = MouseAction.Down, Button = 2 };
@@ -250,22 +536,20 @@ public class LowLevelMouseHook : IDisposable
                     evt = new MouseEventData { Action = MouseAction.Up, Button = 2 };
                     break;
                 case WM_MOUSEMOVE:
-                    evt = new MouseEventData { Action = MouseAction.Move };
+                    if (_leftButtonDown)
+                        evt = new MouseEventData { Action = MouseAction.Move, Button = 0 };
                     break;
                 case WM_MOUSEWHEEL:
-                    // 滚轮通过 OnScrollEvent 单独处理
+                    var hookData = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                    var delta = unchecked((short)(hookData.MouseData >> 16));
+                    _scrollCallback(new ScrollEventData { VScroll = delta / 120f });
                     return CallNextHookEx(_hookId, nCode, wParam, lParam);
             }
 
-            if (evt.Action == MouseAction.Move)
+            if (evt.HasValue)
             {
-                // 获取鼠标屏幕坐标
-                GetCursorPos(out var pt);
-                // 坐标在 WPF 窗口回调中转换
-                evt = evt with { X = pt.X, Y = pt.Y };
+                _callback(evt.Value);
             }
-
-            _callback(evt);
         }
 
         return CallNextHookEx(_hookId, nCode, wParam, lParam);
@@ -292,6 +576,16 @@ public class LowLevelMouseHook : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X; public int Y; }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT
+    {
+        public POINT Point;
+        public uint MouseData;
+        public uint Flags;
+        public uint Time;
+        public UIntPtr ExtraInfo;
+    }
+
     public void Dispose()
     {
         if (_hookId != IntPtr.Zero)
@@ -317,11 +611,15 @@ public class LowLevelKeyboardHook : IDisposable
     private readonly Win32HookProc _proc;
     private readonly Action<KeyEventData> _callback;
 
+    public IntPtr HookHandle => _hookId;
+
     public LowLevelKeyboardHook(Action<KeyEventData> callback)
     {
         _callback = callback;
         _proc = HookCallback;
         _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(null!), 0);
+        if (_hookId == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to install low-level keyboard hook");
     }
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -367,14 +665,14 @@ public class LowLevelKeyboardHook : IDisposable
             0x08 => 67,  // Backspace
             0x0D => 66,  // Enter
             0x20 => 62,  // Space
-            0x1B => 111, // Escape
+            0x1B => 4,   // Escape -> Android Back
             0x09 => 61,  // Tab
             0x25 => 21,  // Left
             0x26 => 19,  // Up
             0x27 => 22,  // Right
             0x28 => 20,  // Down
             0x2E => 112, // Delete
-            0x24 => 92,  // Home
+            0x24 => 3,   // Home -> Android Home
             0x23 => 93,  // End
             0x21 => 122, // Page Up
             0x22 => 123, // Page Down

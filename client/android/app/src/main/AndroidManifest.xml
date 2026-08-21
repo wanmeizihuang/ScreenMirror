@@ -13,16 +13,12 @@
     <!-- 前台服务 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <!-- WakeLock：保持 CPU 唤醒，防止 HarmonyOS 后台冻结编码器 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- 系统弹窗（部分ROM需要） -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-
-    <!-- 锁屏全屏通知 -->
-    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <application
         android:allowBackup="true"
@@ -47,7 +43,7 @@
         <service
             android:name=".core.ScreenCaptureService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection|specialUse"
+            android:foregroundServiceType="mediaProjection"
             android:stopWithTask="false" />
 
         <!-- 反向控制无障碍服务 -->

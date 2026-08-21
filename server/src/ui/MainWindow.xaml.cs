@@ -13,6 +13,10 @@ namespace ScreenMirror.Server.UI;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
+    private static readonly object DiagnosticLogLock = new();
+    private static readonly string DiagnosticLogPath = System.IO.Path.Combine(
+        System.IO.Path.GetTempPath(), "screenmirror-server.log");
+
     private readonly DiscoveryService _discovery;
     private readonly ConnectionManager _connectionManager;
     private readonly MessageRouter _router;
@@ -55,6 +59,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         InitializeComponent();
         DataContext = this;
+        WriteDiagnostic("电脑端启动");
 
         // 全局未捕获异常处理：写到文件 + 弹窗
         AppDomain.CurrentDomain.UnhandledException += (s, e) =>
@@ -83,6 +88,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         // 绑定事件
         _discovery.OnDeviceFound += OnDeviceFound;
+        _discovery.OnDeviceUpdated += OnDeviceUpdated;
         _discovery.OnDeviceLost += OnDeviceLost;
         _discovery.OnLog += msg =>
         {
@@ -126,6 +132,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         Dispatcher.Invoke(() =>
         {
             Devices.Remove(device);
+            OnPropertyChanged(nameof(DeviceCountText));
+        });
+    }
+
+    private void OnDeviceUpdated(DiscoveredDevice previous, DiscoveredDevice current)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            var index = Devices.IndexOf(previous);
+            if (index >= 0)
+                Devices[index] = current;
+            else
+                Devices.Add(current);
             OnPropertyChanged(nameof(DeviceCountText));
         });
     }
@@ -187,21 +206,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 _router.BindToConnection(connection);
 
                 // 打开投屏窗口（VLC 渲染）
-                Dispatcher.Invoke(() =>
-                {
-                    _mirrorWindow = new MirrorWindow(connection);
-                    _mirrorWindow.Closed += (_, _) =>
-                    {
-                        DisconnectDevice();
-                        Show();
-                    };
-                    // 反向控制：绑定投屏窗口句柄并启动输入钩子
-                    _reverseControl.MirrorWindowHandle =
-                        new System.Windows.Interop.WindowInteropHelper(_mirrorWindow).Handle;
-                    _ = _pluginManager.StartAll();
-                    _mirrorWindow.Show();
-                    Hide();
-                });
+                await OpenMirrorWindowAsync(connection);
 
                 StatusText = $"已连接: {device.DeviceName}";
                 StatusBackground = "#E8F5E9";
@@ -227,7 +232,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     /// </summary>
     private async void OnIncomingConnection(ScreenMirror.Protocol.ControlConnection connection)
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(() => OnIncomingConnection(connection));
+            return;
+        }
+
         if (_activeConnection != null) return; // 已连，忽略
+        if (!connection.IsConnected)
+        {
+            WriteDiagnostic($"忽略已断开的连接: {connection.RemoteHost}, id={connection.ConnectionId}");
+            return;
+        }
+
+        WriteDiagnostic($"接受连接: {connection.RemoteHost}, id={connection.ConnectionId}");
 
         StatusText = "手机端已连接...";
         StatusBackground = "#FFF3E0";
@@ -236,7 +254,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         try
         {
             _activeConnection = connection;
-            connection.OnDisconnected += _ => DisconnectDevice();
+            connection.OnDisconnected += _ =>
+            {
+                WriteDiagnostic(
+                    $"连接断开: {connection.RemoteHost}, reason={connection.LastDisconnectReason}");
+                DisconnectDevice();
+            };
 
             // 注册插件 + 初始化
             await _pluginManager.RegisterPlugin(_screenMirror);
@@ -253,21 +276,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _router.BindToConnection(connection);
 
             // 打开 VLC 投屏窗口
-            Dispatcher.Invoke(() =>
-            {
-                _mirrorWindow = new MirrorWindow(connection);
-                _mirrorWindow.Closed += (_, _) =>
-                {
-                    DisconnectDevice();
-                    Show();
-                };
-                // 反向控制：绑定投屏窗口句柄并启动输入钩子
-                _reverseControl.MirrorWindowHandle =
-                    new System.Windows.Interop.WindowInteropHelper(_mirrorWindow).Handle;
-                _ = _pluginManager.StartAll();
-                _mirrorWindow.Show();
-                Hide();
-            });
+            await OpenMirrorWindowAsync(connection);
 
             StatusText = "已连接: 手机端";
             StatusBackground = "#E8F5E9";
@@ -275,6 +284,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
         catch (Exception ex)
         {
+            WriteDiagnostic($"手机连接处理失败: {ex}");
             StatusText = $"手机连接处理失败: {ex.Message}";
             StatusBackground = "#FFEBEE";
             StatusForeground = "#C62828";
@@ -283,10 +293,40 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private bool _isDisconnecting;  // 防止重复断开导致无限递归
 
+    private async Task OpenMirrorWindowAsync(ControlConnection connection)
+    {
+        WriteDiagnostic($"打开投屏窗口: {connection.RemoteHost}");
+        _mirrorWindow = new MirrorWindow(connection);
+        _mirrorWindow.Closed += (_, _) =>
+        {
+            DisconnectDevice();
+            Show();
+        };
+        _mirrorWindow.Show();
+
+        var windowHelper = new System.Windows.Interop.WindowInteropHelper(_mirrorWindow);
+        _reverseControl.InputBoundsProvider = _mirrorWindow.GetVideoScreenBounds;
+        _reverseControl.MirrorWindowHandle = windowHelper.EnsureHandle();
+        try
+        {
+            await _pluginManager.StartAll();
+            WriteDiagnostic(
+                $"反向控制启动完成: state={_reverseControl.State}, " +
+                $"hwnd=0x{_reverseControl.MirrorWindowHandle.ToInt64():X}");
+        }
+        catch (Exception ex)
+        {
+            WriteDiagnostic($"反向控制启动失败: {ex}");
+            StatusText = $"反向控制启动失败: {ex.Message}";
+        }
+        Hide();
+    }
+
     private void DisconnectDevice()
     {
         if (_isDisconnecting) return;  // 已在断开中，跳过
         _isDisconnecting = true;
+        WriteDiagnostic("开始清理投屏连接");
 
         try
         {
@@ -298,6 +338,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             // 使用 BeginInvoke（异步派发）避免 UI 线程死锁
             var win = _mirrorWindow;
             _mirrorWindow = null;
+            _reverseControl.InputBoundsProvider = null;
+            _reverseControl.MirrorWindowHandle = IntPtr.Zero;
             if (win != null)
             {
                 Application.Current.Dispatcher.BeginInvoke(() =>
@@ -348,5 +390,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     protected void OnPropertyChanged([CallerMemberName] string? name = null)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
+
+    private static void WriteDiagnostic(string message)
+    {
+        try
+        {
+            lock (DiagnosticLogLock)
+            {
+                System.IO.File.AppendAllText(
+                    DiagnosticLogPath,
+                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}");
+            }
+        }
+        catch { }
     }
 }

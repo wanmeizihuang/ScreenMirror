@@ -100,6 +100,23 @@ public partial class MirrorWindow : Window
             _vlc.WriteNal(payload.ToArray());
             Interlocked.Increment(ref _nalCount);
         }
+        else if (type == ControlMessageType.Error)
+        {
+            try
+            {
+                var error = ControlProtocolCodec.DecodeError(payload.Span);
+                Dispatcher.BeginInvoke(() =>
+                {
+                    StatusInfo.Text = error.Message;
+                    StatusInfo.Foreground = new System.Windows.Media.SolidColorBrush(
+                        System.Windows.Media.Color.FromRgb(0xFF, 0xC1, 0x07));
+                });
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Invalid error message: {ex}");
+            }
+        }
     }
 
     // ===== 窗口事件 =====
@@ -112,6 +129,24 @@ public partial class MirrorWindow : Window
     private void OnWindowSizeChanged(object sender, SizeChangedEventArgs e)
     {
         // VLC VideoView 自动跟随 Grid 大小，无需手动调整
+    }
+
+    public (float Left, float Top, float Width, float Height)? GetVideoScreenBounds()
+    {
+        if (!VlcVideoView.IsLoaded ||
+            VlcVideoView.ActualWidth <= 0 || VlcVideoView.ActualHeight <= 0)
+        {
+            return null;
+        }
+
+        var topLeft = VlcVideoView.PointToScreen(new Point(0, 0));
+        var bottomRight = VlcVideoView.PointToScreen(
+            new Point(VlcVideoView.ActualWidth, VlcVideoView.ActualHeight));
+        return (
+            (float)topLeft.X,
+            (float)topLeft.Y,
+            (float)(bottomRight.X - topLeft.X),
+            (float)(bottomRight.Y - topLeft.Y));
     }
 
     private void OnPinClick(object sender, RoutedEventArgs e)

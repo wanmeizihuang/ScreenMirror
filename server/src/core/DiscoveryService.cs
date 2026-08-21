@@ -14,6 +14,7 @@ public class DiscoveredDevice
 {
     public string DeviceName { get; init; } = "";
     public string DeviceType { get; init; } = "";
+    public string DeviceId { get; init; } = "";
     public string Host { get; init; } = "";
     public int Port { get; init; }
     public int ProtocolVersion { get; init; }
@@ -36,6 +37,7 @@ public class DiscoveryService : IDisposable
     private readonly ConcurrentDictionary<string, DiscoveredDevice> _devices = new();
 
     public event Action<DiscoveredDevice>? OnDeviceFound;
+    public event Action<DiscoveredDevice, DiscoveredDevice>? OnDeviceUpdated;
     public event Action<DiscoveredDevice>? OnDeviceLost;
     public event Action<string>? OnLog;
 
@@ -250,6 +252,7 @@ public class DiscoveryService : IDisposable
             {
                 DeviceName = root.TryGetProperty("device_name", out var name) ? name.GetString()! : "Unknown",
                 DeviceType = root.TryGetProperty("device_type", out var dt) ? dt.GetString()! : "unknown",
+                DeviceId = root.TryGetProperty("device_id", out var id) ? id.GetString() ?? "" : "",
                 Host = remote.Address.ToString(),
                 Port = root.TryGetProperty("port", out var p) ? p.GetInt32() : ConnectionManager.DefaultControlPort,
                 ProtocolVersion = root.TryGetProperty("version", out var v) ? v.GetInt32() : 1,
@@ -262,15 +265,26 @@ public class DiscoveryService : IDisposable
             var localIP = GetLocalIPAddress();
             if (device.Host == localIP || device.Host == "127.0.0.1") return;
 
-            var key = $"{device.Host}:{device.Port}";
-            bool isNew = !_devices.ContainsKey(key);
-
-            _devices[key] = device;
-
-            if (isNew)
+            var key = GetDeviceKey(device);
+            if (!_devices.TryGetValue(key, out var existing))
             {
+                _devices[key] = device;
                 Log($"发现设备: {device.DeviceName} @ {device.Host}:{device.Port}");
                 OnDeviceFound?.Invoke(device);
+            }
+            else if (existing.Host == device.Host && existing.Port == device.Port)
+            {
+                existing.LastSeen = device.LastSeen;
+            }
+            else if (GetEndpointPreference(device.Host) > GetEndpointPreference(existing.Host))
+            {
+                _devices[key] = device;
+                Log($"更新设备地址: {device.DeviceName} {existing.Host} -> {device.Host}");
+                OnDeviceUpdated?.Invoke(existing, device);
+            }
+            else
+            {
+                Log($"忽略同一设备的次选地址: {device.DeviceName} @ {device.Host}");
             }
 
             // 如果是 discover 请求，回复 present
@@ -293,6 +307,76 @@ public class DiscoveryService : IDisposable
             }
         }
         catch { }
+    }
+
+    private static string GetDeviceKey(DiscoveredDevice device)
+    {
+        return string.IsNullOrWhiteSpace(device.DeviceId)
+            ? $"endpoint:{device.Host}:{device.Port}"
+            : $"device:{device.DeviceType}:{device.DeviceId}";
+    }
+
+    private static int GetEndpointPreference(string host)
+    {
+        if (!IPAddress.TryParse(host, out var remote) ||
+            remote.AddressFamily != AddressFamily.InterNetwork)
+            return 0;
+
+        int bestScore = 1;
+        foreach (var iface in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (iface.OperationalStatus != OperationalStatus.Up ||
+                iface.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                continue;
+
+            var name = iface.Name.ToLowerInvariant();
+            var desc = (iface.Description ?? "").ToLowerInvariant();
+            if (name.Contains("vethernet") || name.Contains("vpn") ||
+                name.Contains("docker") || name.Contains("hyper-v") ||
+                name.Contains("wsl") || name.Contains("virtualbox") ||
+                name.Contains("vmware") || name.Contains("tunnel") ||
+                name.Contains("bluetooth") || desc.Contains("virtual"))
+                continue;
+
+            var properties = iface.GetIPProperties();
+            bool hasDefaultGateway = properties.GatewayAddresses.Any(gateway =>
+                gateway.Address.AddressFamily == AddressFamily.InterNetwork &&
+                !gateway.Address.Equals(IPAddress.Any));
+
+            foreach (var unicast in properties.UnicastAddresses)
+            {
+                if (unicast.Address.AddressFamily != AddressFamily.InterNetwork ||
+                    unicast.IPv4Mask == null ||
+                    !IsSameSubnet(remote, unicast.Address, unicast.IPv4Mask))
+                    continue;
+
+                int score = 100;
+                if (hasDefaultGateway) score += 100;
+                if (iface.NetworkInterfaceType is NetworkInterfaceType.Wireless80211 or
+                    NetworkInterfaceType.Ethernet)
+                    score += 20;
+                bestScore = Math.Max(bestScore, score);
+            }
+        }
+
+        return bestScore;
+    }
+
+    private static bool IsSameSubnet(IPAddress first, IPAddress second, IPAddress mask)
+    {
+        var firstBytes = first.GetAddressBytes();
+        var secondBytes = second.GetAddressBytes();
+        var maskBytes = mask.GetAddressBytes();
+        if (firstBytes.Length != 4 || secondBytes.Length != 4 || maskBytes.Length != 4)
+            return false;
+
+        for (int i = 0; i < 4; i++)
+        {
+            if ((firstBytes[i] & maskBytes[i]) != (secondBytes[i] & maskBytes[i]))
+                return false;
+        }
+
+        return true;
     }
 
     private async Task CleanupLoopAsync(CancellationToken ct)

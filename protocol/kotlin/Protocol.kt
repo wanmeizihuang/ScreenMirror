@@ -1,5 +1,6 @@
 package com.screenmirror.protocol
 
+import android.util.Log
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.InputStream
@@ -10,6 +11,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
 // ============================================================
@@ -122,8 +124,9 @@ object ControlProtocolCodec {
 
     fun decodeTouchEvent(payload: ByteArray): TouchEventData {
         val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        val actionCode = buf.get()
         return TouchEventData(
-            action = TouchAction.entries.first { it.code == buf.get() },
+            action = TouchAction.entries.first { it.code == actionCode },
             pointerId = buf.get().toInt() and 0xFF,
             x = (buf.short.toInt() and 0xFFFF) / 10000f,
             y = (buf.short.toInt() and 0xFFFF) / 10000f,
@@ -144,8 +147,9 @@ object ControlProtocolCodec {
 
     fun decodeKeyEvent(payload: ByteArray): KeyEventData {
         val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        val actionCode = buf.get()
         return KeyEventData(
-            action = KeyAction.entries.first { it.code == buf.get() },
+            action = KeyAction.entries.first { it.code == actionCode },
             keyCode = buf.int,
             metaState = buf.int,
             eventTime = buf.long
@@ -169,15 +173,25 @@ object ControlProtocolCodec {
 
     fun decodeScreenInfo(payload: ByteArray): ScreenInfoData {
         val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        val width = buf.int
+        val height = buf.int
+        val dpi = buf.short.toInt() and 0xFFFF
+        val frameRate = buf.get().toInt() and 0xFF
+        val codecCode = buf.get()
+        val maxBitrateKbps = buf.int
+        val hasAudio = buf.get() == 1.toByte()
+        val audioCodecCode = buf.get()
+        val rotation = (buf.get().toInt() and 0xFF) * 90
         return ScreenInfoData(
-            width = buf.int, height = buf.int,
-            dpi = (buf.short.toInt() and 0xFFFF),
-            frameRate = buf.get().toInt() and 0xFF,
-            codec = VideoCodec.entries.first { it.code == buf.get() },
-            maxBitrateKbps = buf.int,
-            hasAudio = buf.get() == 1.toByte(),
-            audioCodec = AudioCodec.entries.first { it.code == buf.get() },
-            rotation = (buf.get().toInt() and 0xFF) * 90
+            width = width,
+            height = height,
+            dpi = dpi,
+            frameRate = frameRate,
+            codec = VideoCodec.entries.first { it.code == codecCode },
+            maxBitrateKbps = maxBitrateKbps,
+            hasAudio = hasAudio,
+            audioCodec = AudioCodec.entries.first { it.code == audioCodecCode },
+            rotation = rotation
         )
     }
 
@@ -229,11 +243,22 @@ object ControlProtocolCodec {
 
     fun decodeMouseEvent(payload: ByteArray): MouseEventData {
         val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        val actionCode = buf.get()
         return MouseEventData(
-            action = MouseAction.entries.first { it.code == buf.get() },
+            action = MouseAction.entries.first { it.code == actionCode },
             x = (buf.short.toInt() and 0xFFFF) / 10000f,
             y = (buf.short.toInt() and 0xFFFF) / 10000f,
             button = buf.get().toInt() and 0xFF
+        )
+    }
+
+    fun decodeScrollEvent(payload: ByteArray): ScrollEventData {
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        return ScrollEventData(
+            x = (buf.short.toInt() and 0xFFFF) / 10000f,
+            y = (buf.short.toInt() and 0xFFFF) / 10000f,
+            hScroll = buf.short / 100f,
+            vScroll = buf.short / 100f
         )
     }
 
@@ -257,22 +282,29 @@ class ControlConnection(
     companion object {
         private var counter = 0
         private fun generateId() = "${System.currentTimeMillis() % 100000}_${counter++}"
+        private fun monotonicMillis() = System.nanoTime() / 1_000_000
     }
 
     private val input = DataInputStream(socket.getInputStream())
     private val output = DataOutputStream(socket.getOutputStream())
     private val running = AtomicBoolean(true)
+    private val lastReceivedAt = AtomicLong(monotonicMillis())
     private val headerBuffer = ByteArray(ControlProtocolCodec.HEADER_SIZE)
     private val sendLock = Any()  // 防止多线程并发写入损坏帧
 
     var onMessage: ((ControlMessageType, ByteArray) -> Unit)? = null
     var onDisconnected: ((String) -> Unit)? = null
+    @Volatile var lastDisconnectReason: String = "连接中"
+        private set
 
     val isConnected: Boolean get() = socket.isConnected && !socket.isClosed && running.get()
 
     init {
         thread(name = "ctrl-conn-$connectionId", isDaemon = true) {
             readLoop()
+        }
+        thread(name = "ctrl-heartbeat-$connectionId", isDaemon = true) {
+            heartbeatLoop()
         }
     }
 
@@ -282,7 +314,9 @@ class ControlConnection(
             try {
                 output.write(data)
                 output.flush()  // 大帧立即推送，避免 TCP 缓冲堆积
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                disconnect("发送失败: ${e.javaClass.simpleName}: ${e.message}")
+            }
         }
     }
 
@@ -299,20 +333,63 @@ class ControlConnection(
     fun sendMouseEvent(e: MouseEventData) = send(ControlProtocolCodec.encodeMouseEvent(e))
 
     private fun readLoop() {
+        var reason = "远端关闭连接"
         try {
             while (running.get() && isConnected) {
                 input.readFully(headerBuffer)
-                val (type, payloadLen) = ControlProtocolCodec.decodeHeader(headerBuffer) ?: break
+                val decodedHeader = ControlProtocolCodec.decodeHeader(headerBuffer)
+                if (decodedHeader == null) {
+                    reason = "协议头无效"
+                    break
+                }
+                val (type, payloadLen) = decodedHeader
+                if (payloadLen !in 0..ControlProtocolCodec.MAX_PAYLOAD) {
+                    reason = "负载长度无效: $payloadLen"
+                    break
+                }
                 val payload = if (payloadLen > 0) {
                     ByteArray(payloadLen).also { input.readFully(it) }
                 } else ByteArray(0)
-                onMessage?.invoke(type, payload)
+                lastReceivedAt.set(monotonicMillis())
+
+                if (type == ControlMessageType.HEARTBEAT && payload.size == Long.SIZE_BYTES) {
+                    send(ControlProtocolCodec.encodeHeartbeatAck(ControlProtocolCodec.decodeHeartbeat(payload)))
+                }
+                try {
+                    onMessage?.invoke(type, payload)
+                } catch (e: Exception) {
+                    Log.e("ControlConnection", "Message handler failed for $type", e)
+                }
             }
-        } catch (_: Exception) {} finally { disconnect() }
+        } catch (e: Exception) {
+            reason = "读取失败: ${e.javaClass.simpleName}: ${e.message}"
+        } finally {
+            disconnect(reason)
+        }
     }
 
-    fun disconnect() {
-        running.set(false)
+    private fun heartbeatLoop() {
+        try {
+            while (running.get()) {
+                Thread.sleep(3_000)
+                if (!running.get()) break
+
+                if (monotonicMillis() - lastReceivedAt.get() > 10_000) {
+                    disconnect("连接超时: 10秒无入站数据")
+                    break
+                }
+
+                sendHeartbeat()
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    fun disconnect(reason: String = "本地主动断开") {
+        if (!running.getAndSet(false)) return
+        lastDisconnectReason = reason
+        Log.w("ControlConnection", "Disconnected $connectionId: $reason")
         try { socket.close() } catch (_: Exception) {}
         onDisconnected?.invoke(connectionId)
     }
@@ -333,6 +410,8 @@ class ConnectionManager {
     var onConnectionAccepted: ((ControlConnection) -> Unit)? = null
     var onConnectionEstablished: ((ControlConnection) -> Unit)? = null
     var onConnectionLost: ((String) -> Unit)? = null
+    @Volatile var lastConnectionError: String? = null
+        private set
 
     fun startListening(port: Int = DEFAULT_CONTROL_PORT) {
         if (serverSocket != null) return
@@ -354,12 +433,13 @@ class ConnectionManager {
     }
 
     fun connect(host: String, port: Int = DEFAULT_CONTROL_PORT): ControlConnection? {
+        lastConnectionError = null
+        val socket = Socket()
         return try {
-            val socket = Socket(host, port).apply {
-                tcpNoDelay = true           // 禁用 Nagle 算法，小包立即发送
-                sendBufferSize = 256 * 1024  // 256KB 发送缓冲
-                receiveBufferSize = 64 * 1024
-            }
+            socket.tcpNoDelay = true           // 禁用 Nagle 算法，小包立即发送
+            socket.sendBufferSize = 256 * 1024 // 256KB 发送缓冲
+            socket.receiveBufferSize = 64 * 1024
+            socket.connect(java.net.InetSocketAddress(host, port), 5_000)
             val conn = ControlConnection(socket)
             conn.onDisconnected = { id ->
                 connections.remove(id)
@@ -368,7 +448,11 @@ class ConnectionManager {
             connections[conn.connectionId] = conn
             onConnectionEstablished?.invoke(conn)
             conn
-        } catch (_: Exception) { null }
+        } catch (e: Exception) {
+            try { socket.close() } catch (_: Exception) {}
+            lastConnectionError = "${e.javaClass.simpleName}: ${e.message ?: "连接失败"}"
+            null
+        }
     }
 
     fun getConnections(): List<ControlConnection> = connections.values.toList()
